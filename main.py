@@ -97,11 +97,36 @@ def zalo_headers() -> Dict[str, str]:
     return h
 
 def zalo_send_text(user_id: str, text: str) -> dict:
-    url = "https://openapi.zalo.me/v2.0/oa/message"
+    """Gửi tin nhắn text qua Zalo OA API v3.0"""
+    url = "https://openapi.zalo.me/v3.0/oa/message/cs"
     payload = {"recipient": {"user_id": user_id}, "message": {"text": text}}
     r = requests.post(url, headers=zalo_headers(), json=payload, timeout=15)
     if r.status_code >= 400:
         print("Send error:", r.text)
+    return r.json() if r.text else {}
+
+def zalo_send_image(user_id: str, image_url: str, message: str = "") -> dict:
+    """Gửi tin nhắn hình ảnh qua Zalo OA API v3.0"""
+    url = "https://openapi.zalo.me/v3.0/oa/message/cs"
+    payload = {
+        "recipient": {"user_id": user_id},
+        "message": {
+            "attachment": {
+                "type": "template",
+                "payload": {
+                    "template_type": "media",
+                    "elements": [{
+                        "media_type": "image",
+                        "url": image_url,
+                        "title": message
+                    }]
+                }
+            }
+        }
+    }
+    r = requests.post(url, headers=zalo_headers(), json=payload, timeout=15)
+    if r.status_code >= 400:
+        print("Send image error:", r.text)
     return r.json() if r.text else {}
 
 def zalo_get_profile(user_id: str) -> Dict[str, Any]:
@@ -472,12 +497,67 @@ async def webhook(req: Request):
                 return {"status": "invalid_signature"}
     
     event = await req.json()
-    # Parse message
+    
+    # Log event for debugging
+    print(f"Received event: {json.dumps(event, indent=2)}")
+    
+    # Parse event data
     try:
-        user_id = event["sender"]["id"]
+        event_name = event.get("event_name", "")
+        user_id = event.get("sender", {}).get("id")
         user_text = event.get("message", {}).get("text", "").strip()
-    except Exception:
-        return {"status": "ignored"}
+        
+        if not user_id:
+            return {"status": "no_user_id"}
+            
+        # Handle different event types
+        if event_name == "user_send_text":
+            # Text message - continue with existing logic
+            pass
+        elif event_name == "user_send_image":
+            # Image message - extract image and continue
+            user_text = user_text or "[Đã gửi hình ảnh]"
+        elif event_name == "user_send_sticker":
+            # Sticker message
+            zalo_send_text(user_id, "Em đã nhận được sticker rồi ạ! 😊")
+            return {"status": "sticker_received"}
+        elif event_name == "user_send_gif":
+            # GIF message
+            zalo_send_text(user_id, "Em đã nhận được GIF rồi ạ! 🎬")
+            return {"status": "gif_received"}
+        elif event_name == "user_send_audio":
+            # Audio message
+            zalo_send_text(user_id, "Em đã nhận được tin nhắn âm thanh rồi ạ! 🎵")
+            return {"status": "audio_received"}
+        elif event_name == "user_send_video":
+            # Video message
+            zalo_send_text(user_id, "Em đã nhận được video rồi ạ! 🎥")
+            return {"status": "video_received"}
+        elif event_name == "user_send_file":
+            # File message
+            zalo_send_text(user_id, "Em đã nhận được file rồi ạ! 📎")
+            return {"status": "file_received"}
+        elif event_name == "user_send_location":
+            # Location message
+            zalo_send_text(user_id, "Em đã nhận được vị trí rồi ạ! 📍")
+            return {"status": "location_received"}
+        elif event_name == "follow":
+            # User follows OA
+            profile = zalo_get_profile(user_id)
+            welcome_msg = f"Chào mừng {profile.get('display_name', 'bạn')} đến với Locaith AI! 🎉\n\nEm là trợ lý AI của Locaith, sẵn sàng hỗ trợ bạn về:\n• Thiết kế Website\n• Tạo Landing Page\n• Phát triển Chatbot AI\n\nHãy nhắn tin để bắt đầu nhé! 😊"
+            zalo_send_text(user_id, welcome_msg)
+            return {"status": "welcome_sent"}
+        elif event_name == "unfollow":
+            # User unfollows OA
+            return {"status": "unfollowed"}
+        else:
+            # Unknown event type
+            print(f"Unknown event type: {event_name}")
+            return {"status": "unknown_event"}
+            
+    except Exception as e:
+        print(f"Error parsing event: {e}")
+        return {"status": "parse_error"}
 
     # Anti-spam
     if is_spamming(user_id):
