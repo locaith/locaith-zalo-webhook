@@ -7,8 +7,9 @@ import numpy as np
 from PIL import Image
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 import google.generativeai as genai
 from pypdf import PdfReader
@@ -21,6 +22,7 @@ load_dotenv()
 
 ZALO_OA_TOKEN        = os.getenv("ZALO_OA_TOKEN")
 ZALO_APP_SECRET      = os.getenv("ZALO_APP_SECRET", "")
+ZALO_VERIFY_FILE     = os.getenv("ZALO_VERIFY_FILE")
 ENABLE_APPSECRET     = os.getenv("ENABLE_APPSECRET_PROOF", "false").lower() == "true"
 
 GEMINI_API_KEY       = os.getenv("GEMINI_API_KEY")
@@ -28,6 +30,9 @@ ENABLE_CORS          = os.getenv("ENABLE_CORS", "false").lower() == "true"
 ALLOWED_ORIGINS_STR  = os.getenv("ALLOWED_ORIGINS", "*")
 ADMIN_ALERT_USER_ID  = os.getenv("ADMIN_ALERT_USER_ID", "")
 MAX_UPLOAD_MB        = int(os.getenv("MAX_UPLOAD_MB", "25"))
+
+# Zalo Domain Verification
+VERIFY_DIR = "verify"
 
 assert ZALO_OA_TOKEN and GEMINI_API_KEY, "Thiếu ZALO_OA_TOKEN hoặc GEMINI_API_KEY"
 
@@ -428,6 +433,19 @@ def kb_from_url(user_id: str = Form(...), url: str = Form(...)):
         return {"ok": False, "error": "Không tải được URL"}
     index_document(source_id=url, text=text, owner=user_id)
     return {"ok": True}
+
+# ---- Zalo Domain Verification ----
+@app.get("/{verify_name}")
+def serve_zalo_verify(verify_name: str):
+    """
+    Trả về file xác thực của Zalo nếu tên khớp.
+    URL yêu cầu: https://<domain>/<VERIFY_FILE>
+    """
+    if ZALO_VERIFY_FILE and verify_name == ZALO_VERIFY_FILE:
+        path = os.path.join(VERIFY_DIR, ZALO_VERIFY_FILE)
+        if os.path.exists(path):
+            return FileResponse(path, media_type="text/html")
+    raise HTTPException(status_code=404, detail="Not found")
 
 # ---- Zalo webhook ----
 @app.get("/zalo/webhook")
