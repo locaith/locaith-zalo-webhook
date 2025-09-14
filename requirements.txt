@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+requests
+python-dotenv
+google-generativeai
+boto3              # nếu dùng S3
+python-multipart   # để nhận file multipart
+faiss-cpu          # vector store (hoặc dùng chromadb)
+pypdf              # đọc PDF
+python-docx        # đọc DOCX (tùy)
+pillow
+beautifulsoup4
