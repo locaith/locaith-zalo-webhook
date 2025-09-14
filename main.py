@@ -220,11 +220,11 @@ PHONG CÁCH:
 def onboarding(profile: Dict[str, Any]) -> str:
     name = profile.get("display_name") or "bạn"
     return (f"Chào {name}! Em là Trợ lý Locaith AI 🌟\n"
-            "Mình đang quan tâm **Chatbot AI** hay **Website** (Website hoàn chỉnh / Landing page)?\n"
-            "Để hỗ trợ nhanh, cho em xin **Họ tên, SĐT, Email** nhé — đồng ý không ạ?")
+            "Mình đang quan tâm Chatbot AI hay Website (Website hoàn chỉnh / Landing page)?\n"
+            "Để hỗ trợ nhanh, cho em xin Họ tên, SĐT, Email nhé — đồng ý không ạ?")
 
 def ask_contact() -> str:
-    return "Cho em xin **Họ tên, SĐT, Email** nha (ví dụ: Nguyễn A, 09xx..., a@example.com)."
+    return "Cho em xin Họ tên, SĐT, Email nha (ví dụ: Nguyễn A, 09xx..., a@example.com)."
 
 def ask_assets(product: str) -> str:
     if product == "chatbot":
@@ -606,7 +606,7 @@ async def webhook(req: Request):
         if not (s["info"].get("email") and s["info"].get("phone")):
             zalo_send_text(user_id, ask_contact())
             return {"status": "ask_contact_retry"}
-        zalo_send_text(user_id, "Cảm ơn ạ! Anh/chị đang muốn **Chatbot AI**, **Website** hay **Landing page**?")
+        zalo_send_text(user_id, "Cảm ơn ạ! Anh/chị đang muốn Chatbot AI, Website hay Landing page?")
         return {"status": "ask_product"}
 
     # Xác định product
@@ -636,17 +636,17 @@ async def webhook(req: Request):
             if "." in low or "chưa" in low or "không" in low:
                 s["info"]["domain"] = user_text.strip()
             else:
-                zalo_send_text(user_id, "Anh/chị đã có **domain** chưa ạ? (nhập domain, hoặc nói 'chưa có').")
+                zalo_send_text(user_id, "Anh/chị đã có domain chưa ạ? (nhập domain, hoặc nói 'chưa có').")
                 return {"status": "ask_domain"}
         if "logo" not in s["info"]:
             if "logo" in user_text.lower():
                 s["info"]["logo"] = "sẽ gửi"
             else:
                 s["info"]["logo"] = "chưa nhận"
-                zalo_send_text(user_id, "Anh/chị vui lòng cung cấp **logo** và **màu thương hiệu** (gửi file sau cũng được).")
+                zalo_send_text(user_id, "Anh/chị vui lòng cung cấp logo và màu thương hiệu (gửi file sau cũng được).")
 
         summary = (
-            "✅ Tóm tắt:\n"
+            "Tóm tắt:\n"
             f"- Gói: {'Website' if s['product']=='website' else 'Landing page'}\n"
             f"- Liên hệ: {s['info'].get('name')} | {s['info'].get('phone')} | {s['info'].get('email')}\n"
             f"- Domain: {s['info'].get('domain')}\n"
@@ -660,10 +660,10 @@ async def webhook(req: Request):
     if s["product"] == "chatbot":
         if "kb_status" not in s["info"]:
             s["info"]["kb_status"] = "waiting"
-            zalo_send_text(user_id, "Anh/chị vui lòng **gửi tài liệu** (PDF/DOC) hoặc **URL** để train chatbot nhé.")
+            zalo_send_text(user_id, "Anh/chị vui lòng gửi tài liệu (PDF/DOC) hoặc URL để train chatbot nhé.")
             return {"status": "ask_kb"}
         summary = (
-            "✅ Tóm tắt đơn hàng Chatbot AI:\n"
+            "Tóm tắt đơn hàng Chatbot AI:\n"
             f"- Liên hệ: {s['info'].get('name')} | {s['info'].get('phone')} | {s['info'].get('email')}\n"
             "- Tài liệu: đang chờ bạn gửi.\n"
             "Cần tích hợp Website/Fanpage/khác không ạ?"
