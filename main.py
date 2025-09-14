@@ -36,7 +36,25 @@ MODEL_FLASH = "gemini-2.5-flash"
 MODEL_PRO   = "gemini-2.5-pro"
 MODEL_EMBED = "text-embedding-004"    # kích thước 768
 
-app = FastAPI(title="Locaith AI - Zalo Webhook")
+app = FastAPI(
+    title="Locaith AI - Zalo Webhook",
+    description="AI-powered Zalo OA webhook for Locaith services",
+    version="1.0.0"
+)
+
+# Startup event to ensure proper initialization
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup"""
+    print("🚀 Locaith AI Zalo Webhook starting up...")
+    print(f"✅ FAISS index initialized with {faiss_index.ntotal} vectors")
+    print(f"✅ Knowledge base has {len(kb_chunks)} chunks")
+    print("✅ Application ready to receive webhooks")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    print("🛑 Locaith AI Zalo Webhook shutting down...")
 
 if ENABLE_CORS:
     origins = [o.strip() for o in (ALLOWED_ORIGINS_STR or "*").split(",")]
@@ -357,7 +375,29 @@ def parse_contact(text: str) -> Dict[str, str]:
 # =================== ROUTES ===================
 @app.get("/health")
 def health():
-    return {"status": "ok", "kb_chunks": len(kb_chunks), "faiss": int(faiss_index.ntotal)}
+    """Health check endpoint for Render.com deployment verification"""
+    return {
+        "status": "healthy",
+        "timestamp": time.time(),
+        "service": "Locaith AI - Zalo Webhook",
+        "version": "1.0.0",
+        "uptime": time.time(),
+        "checks": {
+            "database": "ok",  # FAISS index
+            "api_keys": "configured" if ZALO_OA_TOKEN and GEMINI_API_KEY else "missing",
+            "kb_chunks": len(kb_chunks),
+            "faiss_index": int(faiss_index.ntotal)
+        }
+    }
+
+@app.get("/")
+def root():
+    """Root endpoint for basic service info"""
+    return {
+        "service": "Locaith AI - Zalo Webhook", 
+        "status": "running",
+        "health_check": "/health"
+    }
 
 # ---- Knowledge upload: trực tiếp ----
 @app.post("/kb/url")

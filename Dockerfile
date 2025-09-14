@@ -19,5 +19,9 @@ COPY . .
 ENV PORT=8080
 EXPOSE 8080
 
-# Run
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Health check for container
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Run with optimized settings for Render.com
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-keep-alive", "30", "--timeout-graceful-shutdown", "30", "--workers", "1"]
