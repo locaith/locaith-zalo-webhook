@@ -1,11 +1,10 @@
 # main.py
-# Locaith AI – Zalo OA Chatbot (Agent Planner)
-# - Fix duplicate greeting; natural VN tone; no markdown
-# - Agents: planner (flash), responder (flash), vision (pro), sticker-mood (pro), web (serper.dev)
-# - Sticker => đoán cảm xúc; Image => OCR/mô tả; Web => gold/coin/stock/forex/news
-# - Dedupe event; anti-spam; per-user short memory
+# Locaith AI – Zalo OA Chatbot (v3.4.0)
+# - Tự động chia nhỏ tin dài, gửi nối tiếp (chunked send)
+# - Dedupe chắc hơn bằng message.msg_id
+# - Giữ toàn bộ Multi-Agent + Crypto TA snapshot + OpenWeather + Vision + Sticker mood + Brand guard + Runtime Constitution
 
-import os, time, hmac, hashlib, json, re, io
+import os, time, hmac, hashlib, json, re, io, math
 from typing import Dict, Any, List, Optional
 
 import requests
@@ -25,14 +24,27 @@ ENABLE_APPSECRET  = os.getenv("ENABLE_APPSECRET_PROOF", "false").lower() == "tru
 
 GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 SERPER_API_KEY    = os.getenv("SERPER_API_KEY", "")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
-ZALO_VERIFY_FILE  = os.getenv("ZALO_VERIFY_FILE")  # ví dụ "zalo123abc.html"
+ZALO_VERIFY_FILE  = os.getenv("ZALO_VERIFY_FILE")
 VERIFY_DIR        = "verify"
 
 EMOJI_ENABLED     = os.getenv("EMOJI_ENABLED", "true").lower() == "true"
 MAX_MSG_PER_30S   = int(os.getenv("MAX_MSG_PER_30S", "6"))
 BAN_DURATION_SEC  = int(os.getenv("BAN_DURATION_SEC", str(24*3600)))
 HISTORY_TURNS     = int(os.getenv("HISTORY_TURNS", "12"))
+
+# ====== NGƯỠNG CHIA TIN NHẮN (có thể chỉnh qua ENV) ======
+ZALO_CHUNK_LIMIT  = int(os.getenv("ZALO_CHUNK_LIMIT", "900"))  # an toàn ~900 ký tự
+ZALO_CHUNK_PAUSE  = float(os.getenv("ZALO_CHUNK_PAUSE", "0.25"))  # nghỉ giữa các phần
+
+PROMPT_CONFIG_PATH = os.getenv("PROMPT_CONFIG_PATH", "").strip()
+
+# Brand guard
+BRAND_NAME     = "Locaith AI"
+BRAND_DEVLINE  = "được đội ngũ founder của Locaith phát triển."
+BRAND_OFFERING = "các giải pháp Chatbot AI và Website (website hoàn chỉnh hoặc landing page)."
+BRAND_INTRO    = f"{BRAND_NAME} là một startup Việt, {BRAND_DEVLINE} Chúng mình cung cấp {BRAND_OFFERING}"
 
 assert ZALO_OA_TOKEN and GEMINI_API_KEY, "Thiếu ZALO_OA_TOKEN hoặc GEMINI_API_KEY"
 
@@ -41,7 +53,7 @@ MODEL_PLANNER   = "gemini-2.5-flash"
 MODEL_RESPONDER = "gemini-2.5-flash"
 MODEL_VISION    = "gemini-2.5-pro"
 
-app = FastAPI(title="Locaith AI – Zalo OA", version="3.1.0")
+app = FastAPI(title="Locaith AI – Zalo OA", version="3.4.0")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
@@ -52,7 +64,7 @@ _rate: Dict[str, List[float]] = {}
 _warn: Dict[str, int] = {}
 _ban_until: Dict[str, float] = {}
 _processed: Dict[str, float] = {}  # dedupe
-_session: Dict[str, Dict[str, Any]] = {}    # per-user
+_session: Dict[str, Dict[str, Any]] = {}
 
 # =================== UTILITIES ===================
 def _appsecret_proof(access_token: str, app_secret: str) -> str:
@@ -64,18 +76,72 @@ def zalo_headers() -> Dict[str, str]:
         h["appsecret_proof"] = _appsecret_proof(ZALO_OA_TOKEN, ZALO_APP_SECRET)
     return h
 
-def zalo_send_text(user_id: str, text: str) -> dict:
-    clean = (text or "").strip()
-    if len(clean) > 4000:
-        clean = clean[:3990] + "..."
+# ---- Low-level: gửi 1 tin nhắn đơn ----
+def _zalo_send_text_once(user_id: str, text: str) -> dict:
     url = "https://openapi.zalo.me/v3.0/oa/message/cs"
-    payload = {"recipient": {"user_id": user_id}, "message": {"text": clean}}
+    payload = {"recipient": {"user_id": user_id}, "message": {"text": text}}
     try:
         r = requests.post(url, headers=zalo_headers(), json=payload, timeout=15)
         return r.json() if r.text else {}
     except Exception as e:
         print("Send error:", e)
         return {}
+
+# ---- Split & send: tự động chia nhỏ tin dài, đánh số (1/3)… ----
+def _smart_split(text: str, limit: int) -> List[str]:
+    s = (text or "").strip()
+    if len(s) <= limit:
+        return [s]
+    # tách theo đoạn trước
+    parts: List[str] = []
+    paras = re.split(r"\n{2,}", s)
+    buf = ""
+    def flush():
+        nonlocal buf
+        if buf.strip():
+            parts.append(buf.strip())
+            buf = ""
+    for p in paras:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) > limit:
+            # tách tiếp theo câu
+            sentences = re.split(r"(?<=[\.\!\?\…;:])\s+", p)
+            for sent in sentences:
+                sent = sent.strip()
+                if not sent:
+                    continue
+                if len(sent) > limit:
+                    # cuối cùng: cắt cứng
+                    for i in range(0, len(sent), limit):
+                        chunk = sent[i:i+limit]
+                        if len(buf) + len(chunk) + 1 > limit:
+                            flush()
+                        buf += ((" " if buf else "") + chunk)
+                else:
+                    if len(buf) + len(sent) + 1 > limit:
+                        flush()
+                    buf += ((" " if buf else "") + sent)
+            flush()
+        else:
+            if len(buf) + len(p) + 2 > limit:
+                flush()
+            buf += (("\n\n" if buf else "") + p)
+    flush()
+    return parts
+
+def zalo_send_text(user_id: str, text: str) -> None:
+    clean = (text or "").strip()
+    if not clean:
+        return
+    chunks = _smart_split(clean, ZALO_CHUNK_LIMIT)
+    total = len(chunks)
+    for idx, ch in enumerate(chunks, 1):
+        prefix = f"({idx}/{total}) " if total > 1 else ""
+        _zalo_send_text_once(user_id, prefix + ch)
+        if idx < total:
+            time.sleep(ZALO_CHUNK_PAUSE)
 
 def zalo_get_profile(user_id: str) -> Dict[str, Any]:
     url = "https://openapi.zalo.me/v2.0/oa/getprofile"
@@ -109,12 +175,8 @@ def escalate_spam(uid: str) -> str:
 
 def ensure_session(uid: str) -> Dict[str, Any]:
     return _session.setdefault(uid, {
-        "welcomed": False,
-        "profile": None,
-        "salute": None,   # cách xưng hô do user cung cấp
-        "history": [],    # [{role,text,ts}]
-        "notes": [],      # ảnh/voice notes (nội bộ)
-        "last_seen": time.time(),
+        "welcomed": False, "profile": None, "salute": None,
+        "history": [], "notes": [], "last_seen": time.time(),
     })
 
 def push_history(uid: str, role: str, text: str):
@@ -130,24 +192,52 @@ def recent_context(uid: str, k: int = 8) -> str:
         for h in s["history"][-k:]
     )
 
+# =================== DEDUPE CHẮC HƠN ===================
+def extract_event_id(evt: dict) -> str:
+    # Ưu tiên msg_id của Zalo; fallback timestamp+event_name+hash(text)
+    mid = (evt.get("message") or {}).get("msg_id")
+    if mid:
+        return f"msg_{mid}"
+    ts = str(evt.get("timestamp", ""))
+    ev = evt.get("event_name", "")
+    txt = ((evt.get("message") or {}).get("text") or "")
+    hx = hashlib.sha256((ts + ev + txt).encode("utf-8")).hexdigest()[:16]
+    return f"{ts}_{ev}_{hx}"
+
 def already_processed(event_id: str) -> bool:
     if not event_id:
         return False
     if event_id in _processed:
         return True
     _processed[event_id] = time.time()
-    if len(_processed) > 500:
-        for k, _ in sorted(_processed.items(), key=lambda x: x[1])[:50]:
+    if len(_processed) > 800:
+        for k, _ in sorted(_processed.items(), key=lambda x: x[1])[:200]:
             _processed.pop(k, None)
     return False
+
+# =================== RUNTIME CONSTITUTION ===================
+def load_runtime_prompt() -> Dict[str, Any]:
+    cfg = {"raw_text": "", "json": None}
+    p = PROMPT_CONFIG_PATH
+    if not p:
+        return cfg
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = f.read()
+        try:
+            cfg["json"] = json.loads(data)
+        except Exception:
+            cfg["raw_text"] = data
+    except Exception as e:
+        print("Cannot load prompt file:", e)
+    return cfg
+
+RUNTIME_PROMPT = load_runtime_prompt()
 
 # =================== EXTRACTORS ===================
 def parse_salute(text: str) -> Optional[str]:
     m = re.search(r"\b(anh|chị|em)\s+[A-Za-zÀ-ỹĐđ][\wÀ-ỹĐđ\s]*", text or "", flags=re.IGNORECASE)
     return m.group(0).strip() if m else None
-
-def extract_event_id(evt: dict) -> str:
-    return evt.get("event_id") or f"{evt.get('timestamp','')}_{evt.get('event_name','')}"
 
 def get_text(evt: dict) -> str:
     return ((evt.get("message") or {}).get("text") or "").strip()
@@ -192,51 +282,112 @@ def serper_search(q: str, n: int = 3) -> str:
         print("Serper error:", e)
         return ""
 
-def build_query(text: str) -> Optional[str]:
+def build_crypto_queries(text: str) -> List[str]:
     t = (text or "").lower()
-    # gold
-    if "giá vàng" in t or "sjc" in t:
-        return "giá vàng SJC hôm nay"
-    # forex
-    mfx = re.search(r"tỷ giá\s+([a-z]{3})/([a-z]{3})", t)
-    if mfx:
-        return f"tỷ giá {mfx.group(1).upper()}/{mfx.group(2).upper()} hôm nay"
-    if "tỷ giá usd" in t or "usd" in t and "tỷ giá" in t:
-        return "tỷ giá USD VND hôm nay"
-    # crypto
-    if "bitcoin" in t or re.search(r"\bbtc\b", t):
-        return "giá BTC hôm nay"
-    if "ethereum" in t or re.search(r"\beth\b", t):
-        return "giá ETH hôm nay"
-    mcoin = re.search(r"giá\s+([a-z0-9]{2,10})\b", t)
-    if mcoin:
-        return f"giá {mcoin.group(1).upper()} hôm nay"
-    # stock (VN tickers 3 chữ cái hoa)
-    mt = re.search(r"\b([A-Z]{3,4})\b", text)
-    if mt and mt.group(1).isupper():
-        tk = mt.group(1)
-        return f"giá cổ phiếu {tk} hôm nay"
-    # generic news/price
-    if any(k in t for k in ["giá", "hôm nay", "mới nhất", "tin tức", "kết quả", "thời tiết"]):
-        return text
-    return None
+    symbol = None
+    m = re.search(r"\b([A-Z]{2,5})\b", text)
+    if m: symbol = m.group(1)
+    if "bitcoin" in t or re.search(r"\bbtc\b", t): symbol = "BTC"
+    if "ethereum" in t or re.search(r"\beth\b", t): symbol = "ETH"
+    if "wld" in t: symbol = "WLD"
+    qs = []
+    if symbol:
+        qs += [
+            f"giá {symbol} hôm nay",
+            f"{symbol} technical analysis RSI MACD today",
+            f"{symbol} order book sentiment news today",
+            f"{symbol} khối lượng giao dịch hôm nay",
+        ]
+    else:
+        qs += ["giá crypto hôm nay", "bitcoin price today"]
+    return qs
+
+def summarize_crypto_from_web(text: str) -> str:
+    queries = build_crypto_queries(text)
+    blocks = []
+    for q in queries:
+        res = serper_search(q, 3)
+        if res:
+            blocks.append(f"• Query: {q}\n{res}")
+    return "\n\n".join(blocks)
+
+# =================== OPENWEATHER ===================
+def get_weather_snapshot(text: str) -> str:
+    if not OPENWEATHER_API_KEY:
+        return "Chưa cấu hình OpenWeather API key."
+    # Tìm city
+    city = None
+    m = re.search(r"(thời tiết|nhiệt độ|mưa)\s+(ở|tại)\s+([^?.,!]+)", text.lower())
+    if m: city = m.group(3).strip()
+    if not city:
+        mc = re.search(r"(?:ở|tại)\s+([^?.,!]+)$", text.lower())
+        if mc: city = mc.group(1).strip()
+    if not city:
+        mc = re.search(r"(thời tiết|nhiệt độ)\s+([^?.,!]+)$", text.lower())
+        if mc: city = mc.group(2).strip()
+
+    city_q = city or "Hanoi"
+    try:
+        url = "https://api.openweathermap.org/data/2.5/weather"
+        params = {"q": city_q, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "vi"}
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return f"Không tìm được thời tiết cho “{city_q}”."
+
+        d = r.json()
+        name  = d.get("name", city_q)
+        desc  = d.get("weather", [{}])[0].get("description", "")
+        main  = d.get("main", {}) or {}
+        windd = d.get("wind", {}) or {}
+
+        temp  = main.get("temp", None)
+        feels = main.get("feels_like", None)
+        hum   = main.get("humidity", None)
+        wind  = windd.get("speed", None)
+
+        line = f"Thời tiết {name}: {desc}. Nhiệt độ {temp}°C (cảm giác {feels}°C), độ ẩm {hum}%, gió {wind} m/s."
+        advice = _weather_advice(desc, float(temp or 0), float(feels or 0), int(hum or 0), float(wind or 0))
+        if advice:
+            line += f"\n{advice}"
+        return line
+    except Exception as e:
+        print("OpenWeather error:", e)
+        return "Mình không lấy được thông tin thời tiết lúc này."
+
+def _weather_advice(desc: str, temp: float, feels: float, hum: int, wind: float) -> str:
+    desc_l = (desc or "").lower()
+    tips = []
+    if any(k in desc_l for k in ["mưa", "dông", "giông", "mưa rào"]):
+        tips.append("mang áo mưa/áo khoác chống nước")
+    if any(k in desc_l for k in ["nắng", "nắng nóng", "nắng gắt", "quang mây"]) and (temp is not None and temp >= 34):
+        tips.append("uống đủ nước, hạn chế ra nắng gắt buổi trưa")
+    if temp is not None and temp <= 20:
+        tips.append("mặc ấm khi ra ngoài")
+    if hum is not None and hum >= 85:
+        tips.append("cẩn thận đường trơn, mang khăn giấy/áo mưa mỏng")
+    if wind is not None and wind >= 10:  # ~36 km/h
+        tips.append("chú ý gió mạnh khi di chuyển bằng xe máy")
+    return ("Lời khuyên: " + "; ".join(tips)) if tips else ""
 
 # =================== AGENTS ===================
 def planner(text: str, has_image: bool, event_name: str) -> Dict[str, Any]:
     t = (text or "").lower()
     if has_image:
-        return {"mode": "VISION", "need_web": False, "need_empathy": False, "need_sales": False}
+        return {"mode": "VISION", "need_web": False, "need_empathy": False, "need_sales": False, "need_weather": False}
     if event_name == "user_send_sticker":
-        return {"mode": "STICKER", "need_web": False, "need_empathy": True, "need_sales": False}
-    # sales cue
+        return {"mode": "STICKER", "need_web": False, "need_empathy": True, "need_sales": False, "need_weather": False}
+    if any(k in t for k in ["công ty gì", "công ty bạn", "bạn là ai", "ai phát triển", "thuộc công ty nào", "locaith là gì", "locaith ai là gì"]):
+        return {"mode": "BRAND", "need_web": False, "need_empathy": False, "need_sales": False, "need_weather": False}
+    if any(k in t for k in ["thời tiết", "nhiệt độ", "mưa", "độ ẩm"]):
+        return {"mode": "WEATHER", "need_web": False, "need_empathy": False, "need_sales": False, "need_weather": True}
+    if any(k in t for k in ["crypto", "coin", "btc", "eth", "wld", "phân tích kỹ thuật", "rsi", "macd", "kháng cự", "hỗ trợ"]):
+        return {"mode": "CRYPTO_TA", "need_web": True, "need_empathy": False, "need_sales": False, "need_weather": False}
     if any(k in t for k in ["locaith", "chatbot", "website", "landing", "giải pháp", "triển khai", "báo giá"]):
-        return {"mode": "SALES", "need_web": False, "need_empathy": False, "need_sales": True}
-    # realtime cue
-    need_web = build_query(t) is not None
-    # empathy cue
-    empathy_kw = ["mệt", "buồn", "lo", "chán", "khó chịu", "áp lực", "con mình", "gia đình", "căng thẳng"]
+        return {"mode": "SALES", "need_web": False, "need_empathy": False, "need_sales": True, "need_weather": False}
+    need_web = any(k in t for k in ["giá", "hôm nay", "mới nhất", "tin tức", "kết quả"])
+    empathy_kw = ["mệt","buồn","lo","chán","khó chịu","áp lực","con mình","gia đình","căng thẳng"]
     need_empathy = any(k in t for k in empathy_kw)
-    return {"mode": "GENERAL", "need_web": need_web, "need_empathy": need_empathy, "need_sales": False}
+    return {"mode": "GENERAL", "need_web": need_web, "need_empathy": need_empathy, "need_sales": False, "need_weather": False}
 
 def agent_vision_summary(image_bytes: bytes) -> str:
     try:
@@ -244,8 +395,8 @@ def agent_vision_summary(image_bytes: bytes) -> str:
     except Exception:
         return "Ảnh không đọc được."
     prompt = (
-        "Hãy đọc nội dung có trong ảnh (OCR nếu có chữ) và tóm tắt ngắn gọn ảnh nói về điều gì. "
-        "Chỉ trả văn bản súc tích."
+        "Nếu ảnh là biểu đồ tài chính, hãy tóm tắt rất ngắn (khung thời gian nếu nhận ra, xu hướng gần đây, mức hỗ trợ/kháng cự nổi bật) "
+        "và lưu ý đây không phải lời khuyên. Nếu là ảnh thường, mô tả súc tích nội dung chính hoặc OCR chữ quan trọng."
     )
     model = genai.GenerativeModel(MODEL_VISION)
     resp = model.generate_content([prompt, image])
@@ -255,65 +406,100 @@ def agent_vision_summary(image_bytes: bytes) -> str:
         return "Không trích xuất được nội dung từ ảnh."
 
 def agent_sticker_mood(image_bytes: Optional[bytes]) -> str:
-    # Nếu Zalo cung cấp ảnh của sticker -> dùng thị giác để suy đoán cảm xúc
     if image_bytes:
         try:
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             prompt = (
-                "Đây là ảnh sticker. Dựa vào nét mặt/cử chỉ, hãy suy đoán cảm xúc chính của sticker "
-                "(một trong các nhóm: vui, buồn, sốc, giận, dỗi, chán, phấn khích, bình thản, yêu thương). "
-                "Trả về đúng một nhãn tiếng Việt."
+                "Đây là ảnh sticker. Dựa vào nét mặt/cử chỉ, hãy suy đoán cảm xúc chính "
+                "(vui, buồn, sốc, giận, dỗi, chán, phấn khích, bình thản, yêu thương). Trả đúng một nhãn tiếng Việt."
             )
             model = genai.GenerativeModel(MODEL_VISION)
             resp = model.generate_content([prompt, image])
-            mood = (resp.text or "").strip().lower()
-            return mood[:40]
+            return (resp.text or "").strip().lower()[:40]
         except Exception:
             pass
-    # fallback
     return "khó đoán"
 
 def agent_web_answer(text: str) -> str:
-    q = build_query(text)
-    if not q:
-        return ""
-    return serper_search(q, 3) or ""
+    return serper_search(text, 3) or ""
+
+def agent_crypto_ta(text: str) -> str:
+    return summarize_crypto_from_web(text) or "Mình chưa lấy được dữ liệu kỹ thuật đáng tin. Bạn nhắc mình thử lại nhé."
+
+# ============== BRAND GUARD & SYSTEM NOTE ==============
+def brand_guard(text: str) -> str:
+    if not text:
+        return text
+    bad = [
+        r"được\s+google\s+phát\s+triển", r"do\s+google\s+xây\s+dựng",
+        r"sản\s+phẩm\s+của\s+google", r"của\s+openai", r"của\s+anthropic",
+        r"của\s+deepmind", r"của\s+gemini", r"mình\s+thuộc\s+google",
+        r"gemini\s+phát\s+triển",
+    ]
+    out = text
+    for pat in bad:
+        out = re.sub(pat, BRAND_DEVLINE, out, flags=re.IGNORECASE)
+    out = re.sub(r"trí tuệ nhân tạo(.*)google", f"trí tuệ nhân tạo {BRAND_DEVLINE}", out, flags=re.IGNORECASE)
+    return out
+
+def constitution_excerpt() -> str:
+    if RUNTIME_PROMPT.get("json"):
+        j = RUNTIME_PROMPT["json"]
+        values = j.get("core_values", {})
+        workflow = j.get("workflow", {})
+        qa = j.get("qa_validation", {}).get("scoring", {})
+        parts = []
+        if values:
+            parts.append("Giá trị: " + ", ".join(values.keys()))
+        if workflow:
+            parts.append("Quy trình: " + workflow.get("flowchart", "input -> output"))
+        if qa:
+            parts.append("QA tổng: " + str(qa.get("max_total", 60)))
+        return " / ".join(parts)
+    if RUNTIME_PROMPT.get("raw_text"):
+        return "Áp dụng Hiến pháp Prompt nội bộ ở chế độ rút gọn."
+    return ""
 
 def system_note(profile: Dict[str, Any], salute: Optional[str], avoid_greeting: bool) -> str:
     name = (profile or {}).get("display_name") or "bạn"
     who = salute or name
-    note = (
-        "Bạn là một trợ lý hội thoại tiếng Việt, nói chuyện tự nhiên như người thật, kín đáo và lịch sự. "
-        f"Gọi đối phương là '{who}'. Không dùng ký tự lạ hay định dạng đậm/nghiêng. "
-        "Chốt một câu hỏi ngắn cuối câu để giữ nhịp hội thoại."
+    base = (
+        "Bạn là trợ lý hội thoại tiếng Việt của Locaith AI, nói tự nhiên như người thật, kín đáo và lịch sự. "
+        f"Gọi đối phương là '{who}'. Không dùng ký tự lạ/định dạng đậm nghiêng. "
+        f"Về nguồn gốc: luôn nêu rõ {BRAND_DEVLINE} Tuyệt đối không nói bạn thuộc hoặc do Google/OpenAI/Anthropic phát triển. "
+        "Được phép lập 'kỹ thuật snapshot' cho crypto bằng cách tổng hợp chỉ báo/khối lượng/tin tức công khai; NHƯNG không đưa lời khuyên đầu tư. "
+        "Chỉ gợi ý về Locaith khi người dùng hỏi hoặc có tín hiệu rõ ràng. "
+        + constitution_excerpt()
     )
     if avoid_greeting:
-        note += " Không mở đầu bằng câu chào; đi thẳng vào nội dung."
-    return note
+        base += " Không mở đầu bằng câu chào; đi thẳng vào nội dung."
+    return base
 
 def agent_responder(profile: Dict[str, Any], salute: Optional[str], user_text: str,
                     ctx: str, web_ctx: str, vision_ctx: str, mood_ctx: str,
+                    tech_ctx: str, weather_ctx: str,
                     mode: str, avoid_greeting: bool) -> str:
-    style = (
-        "Phong cách: tự nhiên, giản dị, không liệt kê quá khô, dùng câu ngắn dễ hiểu."
-        " Chỉ gợi ý giải pháp Locaith khi người dùng chủ động hỏi hoặc có tín hiệu rõ ràng."
-    )
+    style = ("Phong cách: gần gũi, gãy gọn; không liệt kê khô khan; kết thúc bằng một câu hỏi ngắn.")
     mode_hint = {
-        "GENERAL": "Trả lời hoặc trò chuyện bình thường.",
-        "EMPATHY": "Ưu tiên lắng nghe và đồng cảm.",
-        "SALES": "Khám phá nhu cầu, hỏi bối cảnh ngắn gọn; không bán hàng khiên cưỡng.",
+        "GENERAL": "Trò chuyện bình thường.",
+        "EMPATHY": "Lắng nghe và đồng cảm trước, sau đó hỏi mở.",
+        "SALES": "Khám phá nhu cầu, hỏi bối cảnh; không bán hàng khiên cưỡng.",
         "STICKER": "Phản hồi dựa trên cảm xúc ước lượng từ sticker.",
         "VISION": "Giải thích dựa trên thông tin từ ảnh.",
+        "BRAND": f"Nếu hỏi về công ty/ai phát triển → giới thiệu ngắn: {BRAND_INTRO}",
+        "CRYPTO_TA": "Tổng hợp chỉ báo kỹ thuật và tin liên quan (không lời khuyên).",
+        "WEATHER": "Tường thuật thời tiết ngắn gọn, dễ hiểu.",
     }.get(mode, "Trò chuyện tự nhiên.")
-    web_part = f"\n\nThông tin từ internet:\n{web_ctx}" if web_ctx else ""
-    vision_part = f"\n\nThông tin rút ra từ ảnh:\n{vision_ctx}" if vision_ctx else ""
-    mood_part = f"\n\nTâm trạng ước lượng từ sticker: {mood_ctx}" if mood_ctx else ""
+    parts = []
+    if ctx: parts.append(f"Ngữ cảnh gần đây:\n{ctx}")
+    if weather_ctx: parts.append(f"Thời tiết:\n{weather_ctx}")
+    if tech_ctx: parts.append(f"Crypto snapshot:\n{tech_ctx}")
+    if web_ctx and not tech_ctx: parts.append(f"Thông tin từ internet:\n{web_ctx}")
+    if vision_ctx: parts.append(f"Thông tin từ ảnh:\n{vision_ctx}")
+    if mood_ctx: parts.append(f"Tâm trạng ước lượng từ sticker: {mood_ctx}")
+    bundle = "\n\n".join(parts)
 
-    content = (
-        f"{style}\nChế độ: {mode_hint}\n\n"
-        f"Ngữ cảnh gần đây:\n{ctx or '(trống)'}{web_part}{vision_part}{mood_part}\n\n"
-        f"Tin nhắn của người dùng:\n{user_text}"
-    )
+    content = f"{style}\nChế độ: {mode_hint}\n\n{bundle}\n\nTin nhắn của người dùng:\n{user_text}"
     model = genai.GenerativeModel(MODEL_RESPONDER)
     resp = model.generate_content(
         [{"role": "user", "parts": [system_note(profile, salute, avoid_greeting)]},
@@ -321,9 +507,10 @@ def agent_responder(profile: Dict[str, Any], salute: Optional[str], user_text: s
         generation_config={"temperature": 0.6}
     )
     try:
-        return resp.text.strip()
+        out = resp.text.strip()
     except Exception:
-        return "Xin lỗi, mình đang hơi bận. Bạn nhắn lại giúp mình sau một lát nhé."
+        out = "Xin lỗi, mình đang hơi bận. Bạn nhắn lại giúp mình sau một lát nhé."
+    return brand_guard(out)
 
 # =================== WELCOME ===================
 def welcome_line(profile: Dict[str, Any]) -> str:
@@ -336,11 +523,13 @@ def welcome_line(profile: Dict[str, Any]) -> str:
 # =================== ROUTES ===================
 @app.on_event("startup")
 async def on_start():
-    print("Locaith AI – Zalo webhook (Agent) started 3.1.0")
+    print("Locaith AI – Zalo webhook started v3.4.0")
+    if PROMPT_CONFIG_PATH:
+        print("Loaded runtime prompt from:", PROMPT_CONFIG_PATH)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.1.0", "ts": time.time()}
+    return {"status": "ok", "version": "3.4.0", "ts": time.time()}
 
 @app.get("/{verify_name}")
 def zalo_verify(verify_name: str):
@@ -356,7 +545,6 @@ def webhook_verify(challenge: str = ""):
 
 @app.post("/zalo/webhook")
 async def webhook(req: Request):
-    # verify signature (optional)
     if ENABLE_APPSECRET and ZALO_APP_SECRET:
         try:
             body = await req.body()
@@ -378,7 +566,6 @@ async def webhook(req: Request):
     if not user_id:
         return {"status": "no_user"}
 
-    # anti-spam
     if is_spamming(user_id):
         zalo_send_text(user_id, escalate_spam(user_id))
         return {"status": "spam"}
@@ -387,31 +574,27 @@ async def webhook(req: Request):
     if not s["profile"]:
         s["profile"] = zalo_get_profile(user_id)
 
-    # follow/unfollow
+    # follow
     if event_name == "follow":
         if not s["welcomed"]:
             msg = welcome_line(s["profile"])
             zalo_send_text(user_id, msg)
-            zalo_send_text(user_id, "Bạn muốn mình giúp gì hay có điều gì muốn chia sẻ không?")
-            push_history(user_id, "assistant", msg)
-            push_history(user_id, "assistant", "Hôm nay bạn muốn mình giúp điều gì?")
             s["welcomed"] = True
-            avoid_greeting = True
+            push_history(user_id, "assistant", msg)
         return {"status": "ok"}
 
     if user_id in _ban_until and time.time() < _ban_until[user_id]:
         return {"status": "banned"}
 
-    # gather input
     text = get_text(event)
     salute = parse_salute(text) or s.get("salute")
     if salute and s.get("salute") != salute:
         s["salute"] = salute
 
-    img_bytes = get_image_or_sticker_bytes(event) if event_name in ["user_send_image","user_send_sticker"] else None
+    img_bytes = get_image_or_sticker_bytes(event) if event_name in ["user_send_image", "user_send_sticker"] else None
     has_image = bool(img_bytes) and event_name == "user_send_image"
 
-    # some non-text-only events
+    # acks cho các event không có text
     if event_name in ["user_send_gif", "user_send_audio", "user_send_video", "user_send_file", "user_send_location"] and not text:
         short = {
             "user_send_gif": "Mình đã nhận ảnh động.",
@@ -430,47 +613,49 @@ async def webhook(req: Request):
     web_ctx = ""
     vision_ctx = ""
     mood_ctx = ""
+    tech_ctx = ""
+    weather_ctx = ""
 
-    # sticker mood
     if event_name == "user_send_sticker":
         mood_ctx = agent_sticker_mood(img_bytes)
-        mode = "EMPATHY"  # chuyển sang thấu hiểu
+        mode = "EMPATHY"
 
-    # image OCR/summary
-    justWelcomed = False
     if has_image:
         vision_ctx = agent_vision_summary(img_bytes)
         mode = "VISION"
 
-    # realtime search
-    if plan.get("need_web") and text:
+    if plan.get("need_weather"):
+        weather_ctx = get_weather_snapshot(text)
+
+    if mode == "CRYPTO_TA":
+        tech_ctx = agent_crypto_ta(text)
+    elif plan.get("need_web") and text:
         web_ctx = agent_web_answer(text)
 
-    # first-time welcome on first meaningful message
+    # welcome 1 lần, cấm responder lặp chào
     avoid_greeting = False
+    justWelcomed = False
     if not s["welcomed"]:
         msg = welcome_line(s["profile"])
-        zalo_send_text(user_id, msg)             # gửi 1 lần duy nhất
+        zalo_send_text(user_id, msg)
         push_history(user_id, "assistant", msg)
         s["welcomed"] = True
+        avoid_greeting = True
         justWelcomed = True
-        avoid_greeting = True                    # cấm responder lặp “Chào …”
 
-    # build final reply
-    if text or vision_ctx or mood_ctx:
+    if text or vision_ctx or mood_ctx or weather_ctx or tech_ctx:
         push_history(user_id, "user", text or "[non-text]")
 
         final = agent_responder(
             s["profile"], s.get("salute"), text,
             recent_context(user_id, 8), web_ctx, vision_ctx, mood_ctx,
-            mode, avoid_greeting
+            tech_ctx, weather_ctx, mode, avoid_greeting
         )
 
-        # Nếu chỉ là lời chào ngắn của người dùng và vừa gửi welcome,
-        # chỉnh final thành một câu hỏi mở, không lặp lại chào
         if justWelcomed and re.fullmatch(r"(chào|xin chào|alo|hi|hello)[!.\s]*", (text or "").lower()):
             final = "Hôm nay bạn muốn mình giúp điều gì?"
 
+        final = brand_guard(final)
         zalo_send_text(user_id, final)
         push_history(user_id, "assistant", final)
 
@@ -478,7 +663,7 @@ async def webhook(req: Request):
     s["last_seen"] = time.time()
     return {"status": "ok"}
 
-# ---- Optional: simple endpoint để tích hợp URL tài liệu sau này ----
+# Optional KB ingest
 @app.post("/kb/url")
 def kb_url(user_id: str = Form(...), url: str = Form(...)):
     return {"ok": True, "note": "Placeholder ingest. Có thể mở rộng RAG sau."}

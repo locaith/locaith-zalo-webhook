@@ -48,6 +48,9 @@ venv.bak/
 .DS_Store?
 ._*
 .Spotlight-V100
+
+# Backup folders
+save main.py/
 .Trashes
 ehthumbs.db
 Thumbs.db
