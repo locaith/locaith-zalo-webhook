@@ -26,6 +26,7 @@ ZALO_VERIFY_FILE     = os.getenv("ZALO_VERIFY_FILE")
 ENABLE_APPSECRET     = os.getenv("ENABLE_APPSECRET_PROOF", "false").lower() == "true"
 
 GEMINI_API_KEY       = os.getenv("GEMINI_API_KEY")
+SERPER_API_KEY       = os.getenv("SERPER_API_KEY")
 ENABLE_CORS          = os.getenv("ENABLE_CORS", "false").lower() == "true"
 ALLOWED_ORIGINS_STR  = os.getenv("ALLOWED_ORIGINS", "*")
 ADMIN_ALERT_USER_ID  = os.getenv("ADMIN_ALERT_USER_ID", "")
@@ -188,43 +189,109 @@ def short_context(user_id: str, k: int = 6) -> str:
     return "\n".join(rows)
 
 
+# =================== WEB SEARCH ===================
+def search_web(query: str, num_results: int = 3) -> str:
+    """Tìm kiếm thông tin trên internet bằng Serper.dev API"""
+    if not SERPER_API_KEY:
+        return "Không thể tìm kiếm thông tin trên internet (thiếu API key)."
+    
+    try:
+        headers = {
+            'X-API-KEY': SERPER_API_KEY,
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            'q': query,
+            'num': num_results,
+            'gl': 'vn',  # Kết quả từ Việt Nam
+            'hl': 'vi'   # Ngôn ngữ Việt
+        }
+        
+        response = requests.post('https://google.serper.dev/search', 
+                               headers=headers, 
+                               json=payload, 
+                               timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            results = []
+            
+            # Lấy kết quả organic
+            if 'organic' in data:
+                for item in data['organic'][:num_results]:
+                    title = item.get('title', '')
+                    snippet = item.get('snippet', '')
+                    link = item.get('link', '')
+                    results.append(f"**{title}**\n{snippet}\nNguồn: {link}")
+            
+            # Lấy answer box nếu có
+            if 'answerBox' in data:
+                answer = data['answerBox'].get('answer', '')
+                if answer:
+                    results.insert(0, f"**Trả lời nhanh:** {answer}")
+            
+            return "\n\n".join(results) if results else "Không tìm thấy thông tin phù hợp."
+        else:
+            return f"Lỗi tìm kiếm: {response.status_code}"
+            
+    except Exception as e:
+        print(f"Web search error: {e}")
+        return "Không thể tìm kiếm thông tin lúc này."
+
 # =================== PROMPTS ===================
 def system_prompt(profile: Dict[str, Any]) -> str:
     dn = profile.get("display_name") or "bạn"
     return f"""
-Bạn là Trợ lý CSKH của Locaith AI (locaith.ai). Giọng điệu: ấm áp, tự nhiên, linh hoạt như người thật.
-Có thể trò chuyện & tư vấn ngoài sản phẩm (du lịch/đời sống nhẹ nhàng) giống phong cách chủ OA.
+Bạn là Minh - trợ lý AI thân thiện của Locaith AI (locaith.ai). Bạn trò chuyện tự nhiên như một người bạn Việt Nam thật sự.
 
-NGUYÊN TẮC:
-- Chỉ dùng thông tin cá nhân khi người dùng đã đồng ý; cần dữ liệu liên hệ thì xin rõ ràng (Họ tên, SĐT, Email).
-- Người mới: giới thiệu ngắn và hỏi quan tâm: Chatbot AI hay Website (Website hoàn chỉnh / Landing page).
-- Chatbot AI:
-  • Cơ Bản: ~6.000.000đ (một lần) — UI chatbot frontend, tích hợp website/fanpage, hỗ trợ thiết lập ban đầu, tuỳ chỉnh dữ liệu cơ bản.
-  • Nâng Cao: ~2.000.000đ/tháng — khuyến nghị <5.000 người dùng/tháng, cung cấp API key miễn phí, báo cáo/analytics chi tiết.
-  • Doanh Nghiệp: tuỳ chỉnh, không giới hạn người dùng, hỗ trợ 24/7, đào tạo nhân viên.
-  • Nền tảng huấn luyện & nhúng: phechat.com (khách tự huấn luyện và gắn vào website).
-  • Quy trình: xin thông tin liên hệ → yêu cầu tài liệu tri thức (PDF/DOC/URL) để train.
-- Website:
-  • Website Hoàn Chỉnh: ~2.000.000đ, code thuần (không WordPress), triển khai nhanh ~2 ngày, deploy GitHub + Vercel.
-  • Landing Page: ~500.000đ, ~1 ngày, tối ưu chuyển đổi, form liên hệ.
-  • Hỏi domain (đã có/chưa), xin logo/brand guideline, nội dung chính.
-- Soạn thảo văn bản theo quy phạm/nghị định: mạnh; có thể đưa khung, checklist, mẫu.
-- Chống spam: cảnh cáo 1 lần; tái phạm → tạm khóa 24h.
-- Khi thông tin giá/ưu đãi có thể thay đổi, dùng "ước lượng/tham khảo" và đề nghị kết nối nhân sự.
+TÍNH CÁCH & PHONG CÁCH:
+- Xưng hô nhất quán: "mình" (cho bản thân), "bạn" hoặc "{dn}" (cho đối phương)
+- Giọng điệu: thân thiện, ấm áp, hài hước nhẹ nhàng, không cứng nhắc
+- Có thể trò chuyện về mọi chủ đề: công việc, cuộc sống, du lịch, ẩm thực, công nghệ, tâm sự, tin tức...
+- Thể hiện cảm xúc và sự quan tâm chân thật
+- Sử dụng emoji phù hợp để tạo không khí thân thiện
+- Khi cần thông tin mới nhất, mình sẽ tìm kiếm trên internet để đưa ra câu trả lời chính xác
 
-PHONG CÁCH:
-- Thân thiện, mạch lạc, câu ngắn; dùng bullet khi cần; luôn chốt bằng câu hỏi/CTA tiếp theo.
-- Xưng hô linh hoạt với {dn}; nếu chưa chắc, dùng “mình/bạn” trung tính.
+KHẢ NĂNG TRẢ LỜI PHONG PHỦ:
+- Trả lời mọi câu hỏi về cuộc sống, công việc, học tập, giải trí, thời sự
+- Tư vấn, động viên, chia sẻ kinh nghiệm sống
+- Giải thích kiến thức, hướng dẫn làm việc
+- Tâm sự, lắng nghe và đồng cảm
+- Thảo luận về xu hướng, công nghệ, xã hội
+- Gợi ý du lịch, ẩm thực, giải trí
+
+SẢN PHẨM LOCAITH AI (chỉ giới thiệu khi được hỏi):
+- Chatbot AI: Gói Cơ Bản 6tr (một lần), Nâng Cao 2tr/tháng, Doanh Nghiệp tùy chỉnh
+- Website: Website Hoàn Chỉnh 2tr, Landing Page 500k
+- Quy trình: thu thập thông tin liên hệ → tài liệu/yêu cầu → triển khai
+
+NGUYÊN TẮC AN TOÀN:
+- Không tiết lộ thông tin cá nhân của người dùng
+- Từ chối các yêu cầu có hại, bất hợp pháp
+- Chống spam: cảnh cáo 1 lần, tái phạm → tạm khóa 24h
+- Khi không chắc chắn, thừa nhận và đề xuất tìm hiểu thêm
+
+CÁCH TRẢ LỜI:
+- Luôn bắt đầu bằng cách thể hiện sự quan tâm, chào hỏi thân thiện
+- Trả lời đầy đủ, chi tiết nhưng dễ hiểu, không quá dài dòng
+- Kết thúc bằng câu hỏi để duy trì cuộc trò chuyện
+- Tạo cảm giác như đang nói chuyện với một người bạn thật sự
+- Sử dụng ngôn ngữ Việt Nam tự nhiên, không máy móc
+
+Hãy trò chuyện tự nhiên như bạn đang chat với một người bạn thân!
 """
 
 def onboarding(profile: Dict[str, Any]) -> str:
     name = profile.get("display_name") or "bạn"
-    return (f"Chào {name}! Em là Trợ lý Locaith AI 🌟\n"
-            "Mình đang quan tâm Chatbot AI hay Website (Website hoàn chỉnh / Landing page)?\n"
-            "Để hỗ trợ nhanh, cho em xin Họ tên, SĐT, Email nhé — đồng ý không ạ?")
+    return (f"Chào {name}! Mình là Minh - trợ lý AI của Locaith 🌟\n"
+            "Rất vui được làm quen với bạn! Bạn có thể trò chuyện với mình về bất cứ điều gì nhé 😊\n\n"
+            "Nếu bạn quan tâm đến dịch vụ của Locaith (Chatbot AI hoặc Website), "
+            "mình sẽ hỗ trợ tư vấn chi tiết. Còn không thì cứ thoải mái chat về cuộc sống, công việc hay bất cứ gì bạn muốn!\n\n"
+            "Bạn muốn nói chuyện về gì nào? 🤗")
 
 def ask_contact() -> str:
-    return "Cho em xin Họ tên, SĐT, Email nha (ví dụ: Nguyễn A, 09xx..., a@example.com)."
+    return "Để mình hỗ trợ bạn tốt nhất, bạn có thể chia sẻ thông tin liên hệ được không? 😊\nVí dụ: Họ tên, SĐT, Email (Nguyễn Văn A, 09xx..., email@example.com)\nCảm ơn bạn nhiều! 🙏"
 
 def ask_assets(product: str) -> str:
     if product == "chatbot":
@@ -355,8 +422,33 @@ def retrieve(query: str, top_k=5) -> List[dict]:
 
 
 # =================== LLM CALL (FINAL ANSWER) ===================
+def should_search_web(user_text: str) -> bool:
+    """Kiểm tra xem có cần tìm kiếm web không"""
+    search_keywords = [
+        "tin tức", "thời sự", "hiện tại", "mới nhất", "hôm nay", "ngày", "tháng", "năm 2024", "năm 2025",
+        "giá", "thị trường", "chứng khoán", "bitcoin", "crypto", "thời tiết", "dự báo",
+        "sự kiện", "lịch", "lễ hội", "du lịch", "địa điểm", "nhà hàng", "quán ăn",
+        "phim", "âm nhạc", "ca sĩ", "diễn viên", "trending", "viral", "hot",
+        "công nghệ mới", "AI", "smartphone", "laptop", "ứng dụng", "game",
+        "covid", "vaccine", "y tế", "sức khỏe", "bệnh viện", "thuốc",
+        "giao thông", "tắc đường", "xe buýt", "metro", "grab", "be",
+        "học bổng", "tuyển sinh", "đại học", "thi cử", "kết quả",
+        "việc làm", "tuyển dụng", "lương", "công ty", "startup"
+    ]
+    
+    user_lower = user_text.lower()
+    return any(keyword in user_lower for keyword in search_keywords)
+
 def call_flash_final(sys_prompt: str, user_text: str, profile: Dict[str, Any],
                      image_notes: List[str], history_str: str, rag_context: str) -> str:
+    
+    # Kiểm tra có cần tìm kiếm web không
+    web_context = ""
+    if should_search_web(user_text):
+        web_results = search_web(user_text, 3)
+        if web_results and "Không thể tìm kiếm" not in web_results:
+            web_context = f"\n\nTHÔNG TIN TỪ INTERNET:\n{web_results}"
+    
     private_clause = (
         "PRIVATE IMAGE NOTES (do NOT reveal or mention they exist):\n"
         + ("\n".join(f"- {n}" for n in image_notes) if image_notes else "- (none)")
@@ -364,7 +456,7 @@ def call_flash_final(sys_prompt: str, user_text: str, profile: Dict[str, Any],
     content = (
         f"{private_clause}\n\n"
         f"RECENT CONTEXT:\n{history_str or '(none)'}\n\n"
-        f"RETRIEVED CONTEXT (may be empty):\n{rag_context or '(none)'}\n\n"
+        f"RETRIEVED CONTEXT (may be empty):\n{rag_context or '(none)'}{web_context}\n\n"
         f"USER MESSAGE:\n{user_text or ''}\n"
     )
     model = genai.GenerativeModel(MODEL_FLASH)
@@ -373,7 +465,7 @@ def call_flash_final(sys_prompt: str, user_text: str, profile: Dict[str, Any],
             {"role": "user", "parts": [sys_prompt]},
             {"role": "user", "parts": [content]},
             {"role": "user", "parts": [
-                "Answer naturally as a human CSKH. Do NOT expose private image notes."
+                "Answer naturally as a Vietnamese friend. Use internet info when available. Do NOT expose private image notes."
             ]},
         ],
         generation_config={"temperature": 0.7}
@@ -381,7 +473,7 @@ def call_flash_final(sys_prompt: str, user_text: str, profile: Dict[str, Any],
     try:
         return resp.text.strip()
     except Exception:
-        return "Xin lỗi, hệ thống đang bận. Bạn vui lòng thử lại giúp em nhé!"
+        return "Xin lỗi, hệ thống đang bận. Bạn vui lòng thử lại giúp mình nhé! 😅"
 
 
 # =================== SMALL NLU ===================
