@@ -430,8 +430,29 @@ def kb_from_url(user_id: str = Form(...), url: str = Form(...)):
     return {"ok": True}
 
 # ---- Zalo webhook ----
+@app.get("/zalo/webhook")
+async def webhook_verification(challenge: str = None):
+    """Webhook verification endpoint for Zalo OA"""
+    if challenge:
+        return {"challenge": challenge}
+    return {"error": "Missing challenge parameter"}
+
 @app.post("/zalo/webhook")
 async def webhook(req: Request):
+    """Main webhook endpoint for processing Zalo messages"""
+    # Verify signature if enabled
+    if ENABLE_APPSECRET and ZALO_APP_SECRET:
+        signature = req.headers.get("X-ZEvent-Signature")
+        if signature:
+            body = await req.body()
+            expected_signature = hmac.new(
+                ZALO_APP_SECRET.encode(),
+                body,
+                hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(signature, expected_signature):
+                return {"status": "invalid_signature"}
+    
     event = await req.json()
     # Parse message
     try:
