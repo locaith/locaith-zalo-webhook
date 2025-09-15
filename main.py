@@ -1,60 +1,43 @@
 # main.py
-# Locaith AI – Zalo OA Chatbot (v3.6.0)
-# - Zalo TokenManager: đọc token từ .env, tự refresh (v4/oa/access_token), cache cục bộ, retry tự động khi hết hạn
-# - Gửi Zalo với access_token ở query string (ổn định)
-# - Dùng user_id_by_app để gửi (đúng chuẩn)
-# - Multi-agent (weather+serper, crypto/stock symbol normalizer, vision OCR, sticker mood)
-# - Chunked send (tự chia tin dài), anti-dup, rate-limit, brand-guard
-# - Keep-alive thread + /ping
+# Locaith AI – Zalo OA Chatbot (v3.5.0)
+# - Weather Agent dùng Serper để chuẩn hoá địa danh toàn cầu, forecast "ngày mai"
+# - Ticker/Coin Normalizer Agent (Serper) -> Crypto TA snapshot
+# - Chunked send, dedupe, brand guard, multi-agent, runtime constitution
 
-import os, time, hmac, hashlib, json, re, io, unicodedata, threading, random
+import os, time, hmac, hashlib, json, re, io, unicodedata
 from typing import Dict, Any, List, Optional
 
 import requests
-from fastapi import FastAPI, Request, Form, HTTPException, Query
+from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from PIL import Image
 import google.generativeai as genai
 
-# =================== ENV ===================
+# =================== ENV & INIT ===================
 load_dotenv()
 
-# Zalo OA auth (auto-refresh)
-ZALO_OA_TOKEN      = os.getenv("ZALO_OA_TOKEN", "")
-ZALO_REFRESH_TOKEN = os.getenv("ZALO_REFRESH_TOKEN", "")
-ZALO_APP_ID        = os.getenv("ZALO_APP_ID", "")
-ZALO_APP_SECRET    = os.getenv("ZALO_APP_SECRET", "")
-ZALO_TOKEN_CACHE   = os.getenv("ZALO_TOKEN_CACHE", "token_cache.json")
+ZALO_OA_TOKEN     = os.getenv("ZALO_OA_TOKEN", "")
+ZALO_APP_SECRET   = os.getenv("ZALO_APP_SECRET", "")
+ENABLE_APPSECRET  = os.getenv("ENABLE_APPSECRET_PROOF", "false").lower() == "true"
 
-ZALO_APP_SECRET_SIG   = os.getenv("ZALO_APP_SECRET", "")        # dùng cho appsecret_proof (nếu bật)
-ENABLE_APPSECRET_PROOF= os.getenv("ENABLE_APPSECRET_PROOF","false").lower()=="true"
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
+SERPER_API_KEY    = os.getenv("SERPER_API_KEY", "")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
-# Gemini / Serper / Weather
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
-SERPER_API_KEY     = os.getenv("SERPER_API_KEY", "")
-OPENWEATHER_API_KEY= os.getenv("OPENWEATHER_API_KEY", "")
+ZALO_VERIFY_FILE  = os.getenv("ZALO_VERIFY_FILE")
+VERIFY_DIR        = "verify"
 
-# Zalo verify file (nếu dùng)
-ZALO_VERIFY_FILE   = os.getenv("ZALO_VERIFY_FILE")
-VERIFY_DIR         = "verify"
+EMOJI_ENABLED     = os.getenv("EMOJI_ENABLED", "true").lower() == "true"
+MAX_MSG_PER_30S   = int(os.getenv("MAX_MSG_PER_30S", "6"))
+BAN_DURATION_SEC  = int(os.getenv("BAN_DURATION_SEC", str(24*3600)))
+HISTORY_TURNS     = int(os.getenv("HISTORY_TURNS", "12"))
 
-# Behavior
-EMOJI_ENABLED      = os.getenv("EMOJI_ENABLED", "true").lower()=="true"
-MAX_MSG_PER_30S    = int(os.getenv("MAX_MSG_PER_30S", "6"))
-BAN_DURATION_SEC   = int(os.getenv("BAN_DURATION_SEC", str(24*3600)))
-HISTORY_TURNS      = int(os.getenv("HISTORY_TURNS", "12"))
-ZALO_CHUNK_LIMIT   = int(os.getenv("ZALO_CHUNK_LIMIT", "900"))
-ZALO_CHUNK_PAUSE   = float(os.getenv("ZALO_CHUNK_PAUSE", "0.25"))
+ZALO_CHUNK_LIMIT  = int(os.getenv("ZALO_CHUNK_LIMIT", "900"))
+ZALO_CHUNK_PAUSE  = float(os.getenv("ZALO_CHUNK_PAUSE", "0.25"))
 
 PROMPT_CONFIG_PATH = os.getenv("PROMPT_CONFIG_PATH", "").strip()
-
-# Keep-alive (tùy chọn)
-KEEPALIVE_URL         = os.getenv("KEEPALIVE_URL", "").strip()
-KEEPALIVE_INTERVAL_SEC= int(os.getenv("KEEPALIVE_INTERVAL_SEC", "480"))
-KEEPALIVE_JITTER_SEC  = int(os.getenv("KEEPALIVE_JITTER_SEC", "20"))
-KEEPALIVE_TOKEN       = os.getenv("KEEPALIVE_TOKEN", "")
 
 # Brand guard
 BRAND_NAME     = "Locaith AI"
@@ -62,13 +45,14 @@ BRAND_DEVLINE  = "được đội ngũ founder của Locaith phát triển."
 BRAND_OFFERING = "các giải pháp Chatbot AI và Website (website hoàn chỉnh hoặc landing page)."
 BRAND_INTRO    = f"{BRAND_NAME} là một startup Việt, {BRAND_DEVLINE} Chúng mình cung cấp {BRAND_OFFERING}"
 
-assert GEMINI_API_KEY, "Thiếu GEMINI_API_KEY"
+assert ZALO_OA_TOKEN and GEMINI_API_KEY, "Thiếu ZALO_OA_TOKEN hoặc GEMINI_API_KEY"
+
 genai.configure(api_key=GEMINI_API_KEY)
 MODEL_PLANNER   = "gemini-2.5-flash"
 MODEL_RESPONDER = "gemini-2.5-flash"
 MODEL_VISION    = "gemini-2.5-pro"
 
-app = FastAPI(title="Locaith AI – Zalo OA", version="3.6.0")
+app = FastAPI(title="Locaith AI – Zalo OA", version="3.5.0")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
@@ -81,107 +65,36 @@ _ban_until: Dict[str, float] = {}
 _processed: Dict[str, float] = {}
 _session: Dict[str, Dict[str, Any]] = {}
 
-# =================== TOKEN MANAGER ===================
-class ZaloTokenManager:
-    """
-    Quản lý access_token/refresh_token của OA:
-      - Ưu tiên đọc từ cache file (nếu có), rồi fallback env
-      - Tự refresh qua endpoint: POST https://oauth.zaloapp.com/v4/oa/access_token
-        body: { app_id, grant_type: "refresh_token", refresh_token, app_secret? }
-      - Khi gặp lỗi token (401 / error code), tự refresh và retry 1 lần
-    """
-    def __init__(self):
-        self.token = ZALO_OA_TOKEN.strip()
-        self.refresh_token = ZALO_REFRESH_TOKEN.strip()
-        self.app_id = ZALO_APP_ID.strip()
-        self.app_secret = ZALO_APP_SECRET.strip()
-        self.cache_path = ZALO_TOKEN_CACHE
-        self._load_cache()
-
-    def _log(self, *a): print("ZALO_TOKEN", *a)
-
-    def _load_cache(self):
-        try:
-            if os.path.exists(self.cache_path):
-                with open(self.cache_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if data.get("access_token"): self.token = data["access_token"]
-                if data.get("refresh_token"): self.refresh_token = data["refresh_token"]
-                self._log("loaded cache:", self._mask(self.token), self._mask(self.refresh_token))
-        except Exception as e:
-            self._log("cache load error:", e)
-
-    def _save_cache(self):
-        try:
-            data = {"access_token": self.token, "refresh_token": self.refresh_token, "ts": time.time()}
-            with open(self.cache_path, "w", encoding="utf-8") as f:
-                json.dump(data, f)
-            self._log("saved cache:", self._mask(self.token))
-        except Exception as e:
-            self._log("cache save error:", e)
-
-    def _mask(self, s: str) -> str:
-        if not s: return ""
-        return s[:4] + "..." + s[-4:]
-
-    def get(self) -> str: return self.token
-
-    def configured_for_refresh(self) -> bool:
-        return bool(self.refresh_token and self.app_id)
-
-    def refresh(self) -> bool:
-        if not self.configured_for_refresh():
-            self._log("refresh NOT configured (missing refresh_token/app_id)")
-            return False
-        url = "https://oauth.zaloapp.com/v4/oa/access_token"
-        payload = {
-            "app_id": self.app_id,
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token
-        }
-        if self.app_secret:
-            payload["app_secret"] = self.app_secret
-        try:
-            r = requests.post(url, json=payload, timeout=15)
-            # không in full token trong log
-            text = r.text[:200]
-            self._log("refresh resp", r.status_code, text)
-            if r.status_code != 200:
-                return False
-            d = r.json()
-            if d.get("access_token"):
-                self.token = d["access_token"]
-                if d.get("refresh_token"): self.refresh_token = d["refresh_token"]
-                self._save_cache()
-                return True
-        except Exception as e:
-            self._log("refresh error:", e)
-        return False
-
-TOKEN = ZaloTokenManager()
-
-# =================== ZALO HELPERS ===================
+# =================== COMMON UTILS ===================
 def _appsecret_proof(access_token: str, app_secret: str) -> str:
     return hmac.new(app_secret.encode(), access_token.encode(), hashlib.sha256).hexdigest()
 
-def zalo_params():
-    p = {"access_token": TOKEN.get()}
-    if ENABLE_APPSECRET_PROOF and ZALO_APP_SECRET_SIG:
-        p["appsecret_proof"] = _appsecret_proof(TOKEN.get(), ZALO_APP_SECRET_SIG)
-    return p
+def zalo_headers() -> Dict[str, str]:
+    h = {"Content-Type": "application/json", "access_token": ZALO_OA_TOKEN}
+    if ENABLE_APPSECRET and ZALO_APP_SECRET:
+        h["appsecret_proof"] = _appsecret_proof(ZALO_OA_TOKEN, ZALO_APP_SECRET)
+    return h
+
+def _zalo_send_text_once(user_id: str, text: str) -> dict:
+    url = "https://openapi.zalo.me/v3.0/oa/message/cs"
+    payload = {"recipient": {"user_id": user_id}, "message": {"text": text}}
+    try:
+        r = requests.post(url, headers=zalo_headers(), json=payload, timeout=15)
+        return r.json() if r.text else {}
+    except Exception as e:
+        print("Send error:", e); return {}
 
 def _smart_split(text: str, limit: int) -> List[str]:
     s = (text or "").strip()
     if len(s) <= limit: return [s]
-    parts, buf = [], ""
-    import itertools
-    paras = re.split(r"\n{2,}", s)
-    for p in paras:
-        p = p.strip()
+    parts: List[str] = []
+    buf = ""
+    # tách theo đoạn → câu → cắt cứng
+    for para in re.split(r"\n{2,}", s):
+        p = para.strip()
         if not p: continue
         if len(p) > limit:
-            sents = re.split(r"(?<=[\.\!\?\…;:])\s+", p)
-            for sent in sents:
+            for sent in re.split(r"(?<=[\.\!\?\…;:])\s+", p):
                 sent = sent.strip()
                 if not sent: continue
                 if len(sent) > limit:
@@ -202,33 +115,6 @@ def _smart_split(text: str, limit: int) -> List[str]:
     if buf: parts.append(buf.strip())
     return parts
 
-def _zalo_send_text_once(user_id: str, text: str) -> dict:
-    url = "https://openapi.zalo.me/v3.0/oa/message/cs"
-    payload = {"recipient": {"user_id": user_id}, "message": {"text": text}}
-    try:
-        r = requests.post(url, params=zalo_params(), json=payload, timeout=15)
-        print("ZALO_SEND_RESULT", r.status_code, r.text)
-        if r.status_code == 401:
-            # token hết hạn → refresh & retry
-            if TOKEN.refresh():
-                r2 = requests.post(url, params=zalo_params(), json=payload, timeout=15)
-                print("ZALO_SEND_RESULT_RETRY", r2.status_code, r2.text)
-                return r2.json() if r2.text else {}
-        else:
-            # một số lỗi token có error code, ví dụ -201/-216…
-            try:
-                j = r.json()
-                if j.get("error") in [-201, -216, -124, -113]:
-                    if TOKEN.refresh():
-                        r2 = requests.post(url, params=zalo_params(), json=payload, timeout=15)
-                        print("ZALO_SEND_RESULT_RETRY", r2.status_code, r2.text)
-                        return r2.json() if r2.text else {}
-            except Exception:
-                pass
-        return r.json() if r.text else {}
-    except Exception as e:
-        print("Send error:", e); return {}
-
 def zalo_send_text(user_id: str, text: str) -> None:
     clean = (text or "").strip()
     if not clean: return
@@ -242,17 +128,13 @@ def zalo_send_text(user_id: str, text: str) -> None:
 def zalo_get_profile(user_id: str) -> Dict[str, Any]:
     url = "https://openapi.zalo.me/v2.0/oa/getprofile"
     try:
-        r = requests.post(url, params=zalo_params(), json={"user_id": user_id}, timeout=15)
-        print("ZALO_GETPROFILE_RESULT", r.status_code, r.text)
-        if r.status_code == 401 and TOKEN.refresh():
-            r = requests.post(url, params=zalo_params(), json={"user_id": user_id}, timeout=15)
-            print("ZALO_GETPROFILE_RESULT_RETRY", r.status_code, r.text)
+        r = requests.post(url, headers=zalo_headers(), json={"user_id": user_id}, timeout=15)
         return r.json().get("data", {}) if r.status_code == 200 else {}
     except Exception as e:
         print("Get profile error:", e); return {}
 
-# =================== UTILS/SESSION ===================
-def emoji(s: str) -> str: return s if EMOJI_ENABLED else ""
+def emoji(s: str) -> str:
+    return s if EMOJI_ENABLED else ""
 
 def is_spamming(uid: str) -> bool:
     now = time.time()
@@ -269,7 +151,10 @@ def escalate_spam(uid: str) -> str:
     return "Bạn đã bị tạm khóa tương tác 24 giờ do gửi quá nhiều tin trong thời gian ngắn."
 
 def ensure_session(uid: str) -> Dict[str, Any]:
-    return _session.setdefault(uid, {"welcomed": False, "profile": None, "salute": None, "history": [], "notes": [], "last_seen": time.time()})
+    return _session.setdefault(uid, {
+        "welcomed": False, "profile": None, "salute": None,
+        "history": [], "notes": [], "last_seen": time.time(),
+    })
 
 def push_history(uid: str, role: str, text: str):
     s = ensure_session(uid)
@@ -288,8 +173,6 @@ def extract_event_id(evt: dict) -> str:
     hx = hashlib.sha256((ts+ev+txt).encode("utf-8")).hexdigest()[:16]
     return f"{ts}_{ev}_{hx}"
 
-_processed: Dict[str, float] = {}
-
 def already_processed(event_id: str) -> bool:
     if not event_id: return False
     if event_id in _processed: return True
@@ -298,7 +181,7 @@ def already_processed(event_id: str) -> bool:
         for k,_ in sorted(_processed.items(), key=lambda x:x[1])[:200]: _processed.pop(k,None)
     return False
 
-# =================== PROMPT RUNTIME ===================
+# =================== RUNTIME CONSTITUTION ===================
 def load_runtime_prompt() -> Dict[str, Any]:
     cfg = {"raw_text": "", "json": None}
     if not PROMPT_CONFIG_PATH: return cfg
@@ -306,20 +189,21 @@ def load_runtime_prompt() -> Dict[str, Any]:
         data = open(PROMPT_CONFIG_PATH, "r", encoding="utf-8").read()
         try: cfg["json"] = json.loads(data)
         except Exception: cfg["raw_text"] = data
-    except Exception as e: print("Cannot load prompt file:", e)
+    except Exception as e:
+        print("Cannot load prompt file:", e)
     return cfg
 RUNTIME_PROMPT = load_runtime_prompt()
 
-# =================== NLP HELPERS ===================
+# =================== INPUT NORMALIZATION ===================
 def strip_accents(s: str) -> str:
     if not s: return s
-    import unicodedata as ud
-    nfkd = ud.normalize('NFKD', s)
-    return ''.join([c for c in nfkd if not ud.combining(c)])
+    nfkd = unicodedata.normalize('NFKD', s)
+    return ''.join([c for c in nfkd if not unicodedata.combining(c)])
 
 def detect_day(text: str) -> str:
     t = (text or "").lower()
-    return "tomorrow" if any(k in t for k in ["ngày mai", "mai", "tomorrow"]) else "today"
+    if any(k in t for k in ["ngày mai", "mai", "tomorrow"]): return "tomorrow"
+    return "today"
 
 def detect_location_candidates(text: str) -> List[str]:
     t = text or ""
@@ -327,16 +211,19 @@ def detect_location_candidates(text: str) -> List[str]:
     for pat in [r"(?:ở|tại)\s+([^?.,!\n]+)", r"(thời tiết|nhiệt độ|mưa)\s+(?:ở|tại)?\s*([^?.,!\n]+)"]:
         m = re.search(pat, t, flags=re.IGNORECASE)
         if m: cands.append(m.group(len(m.groups())))
+    # đuôi câu
     m = re.search(r"(?:ở|tại)\s+([^?.,!\n]+)$", t, flags=re.IGNORECASE)
     if m: cands.append(m.group(1))
+    # fallback: toàn câu (để serper đoán)
     cands.append(t)
+    # loại rỗng, tỉa khoảng trắng
     uniq = []
     for x in cands:
         x = (x or "").strip()
         if x and x not in uniq: uniq.append(x)
     return uniq[:3]
 
-# =================== SERPER ===================
+# =================== SERPER HELPERS ===================
 def serper_search(q: str, n: int = 3) -> str:
     if not SERPER_API_KEY: return ""
     try:
@@ -362,7 +249,9 @@ def serper_search(q: str, n: int = 3) -> str:
         print("Serper error:", e); return ""
 
 def serper_normalize_place(free_text: str) -> Optional[str]:
+    """Dùng Serper để suy ra tên địa danh chuẩn từ chuỗi tự do."""
     if not SERPER_API_KEY: return None
+    # Ưu tiên VN trước nhưng để global
     query = f"{free_text} city OR thành phố OR tỉnh OR quốc gia"
     try:
         r = requests.post(
@@ -374,13 +263,15 @@ def serper_normalize_place(free_text: str) -> Optional[str]:
         if r.status_code != 200: return None
         d = r.json()
         kg = d.get("knowledgeGraph") or {}
-        title = (kg.get("title") or "").strip()
+        title = kg.get("title")
         ktype = (kg.get("type") or "").lower()
-        if title and any(k in ktype for k in ["city", "thành phố", "province", "country", "đô thị", "vietnam"]):
+        if title and any(k in ktype for k in ["city", "thành phố", "province", "country", "vietnam", "đô thị"]):
             return title
+        # fallback: lấy từ organic title (cắt phần sau dấu – hoặc |)
         for it in (d.get("organic") or []):
             t = (it.get("title") or "").strip()
             if not t: continue
+            # ví dụ: "Nha Trang – Wikipedia tiếng Việt" → "Nha Trang"
             name = re.split(r"[-–|·]", t)[0].strip()
             if 2 <= len(name) <= 64 and not name.lower().startswith(("thời tiết","weather")):
                 return name
@@ -389,8 +280,13 @@ def serper_normalize_place(free_text: str) -> Optional[str]:
     return None
 
 def serper_guess_symbol(query: str, is_crypto_hint: bool=False) -> Optional[str]:
+    """Đoán ticker/coin symbol từ tên công ty/coin."""
     if not SERPER_API_KEY: return None
-    q = f"{query} coin symbol OR mã token" if is_crypto_hint else f"mã cổ phiếu {query} OR stock ticker {query}"
+    q = query
+    if is_crypto_hint:
+        q = f"{query} coin symbol OR mã token"
+    else:
+        q = f"mã cổ phiếu {query} OR stock ticker {query}"
     try:
         r = requests.post(
             "https://google.serper.dev/search",
@@ -400,19 +296,24 @@ def serper_guess_symbol(query: str, is_crypto_hint: bool=False) -> Optional[str]
         )
         if r.status_code != 200: return None
         d = r.json()
+        # quét các ký hiệu in hoa 2-6 ký tự trong title/snippet
         pat = re.compile(r"\b[A-Z]{2,6}\b")
         kg = d.get("knowledgeGraph") or {}
         for field in [kg.get("title",""), kg.get("description","")]:
-            for m in pat.findall(field or ""): return m
+            for m in pat.findall(field or ""):
+                return m
         for it in (d.get("organic") or []):
             for field in [it.get("title",""), it.get("snippet","")]:
-                for m in pat.findall(field or ""):
-                    if m not in ["AND","OR","THE","WITH"]: return m
+                ms = pat.findall(field or "")
+                for m in ms:
+                    # bỏ qua từ chung như "OR", "AND"
+                    if m not in ["AND","OR","THE","WITH"]:
+                        return m
     except Exception as e:
         print("Serper guess symbol error:", e)
     return None
 
-# =================== WEATHER (GLOBAL) ===================
+# =================== WEATHER (GLOBAL, SMART) ===================
 def _weather_advice(desc: str, tmin: float, tavg: float, tmax: float, wind_max: float) -> str:
     d = (desc or "").lower()
     tips = []
@@ -434,7 +335,8 @@ def _owm_geocode(city: str, key: str):
 
 def _summarize_tomorrow(forecast_json: dict):
     city = forecast_json.get("city", {})
-    tz = city.get("timezone", 0); name = city.get("name", "")
+    tz = city.get("timezone", 0)
+    name = city.get("name", "")
     lst = forecast_json.get("list", []) or []
     if not lst: return None
     now_utc = time.time()
@@ -469,20 +371,24 @@ def get_weather_snapshot(text: str) -> str:
     key = OPENWEATHER_API_KEY
     if not key: return "Chưa cấu hình OpenWeather API key."
     day = detect_day(text)
+    # chuẩn hoá địa danh từ nhiều nguồn
     candidates = detect_location_candidates(text)
     norm = None
     for cand in candidates:
+        # thử trực tiếp
         geo = _owm_geocode(cand, key)
         if geo: norm = geo; break
+        # thử serper để sửa chính tả/chuẩn tên
         hint = serper_normalize_place(cand)
         if hint:
             geo = _owm_geocode(hint, key)
             if geo: norm = geo; break
+        # thử dạng không dấu
         m = strip_accents(cand)
         if m != cand:
             geo = _owm_geocode(m, key)
             if geo: norm = geo; break
-    if not norm: return "Mình chưa xác định được địa danh bạn muốn tra. Bạn nhắn lại tên thành phố rõ hơn giúp mình nhé."
+    if not norm: return "Mình chưa xác định được địa danh bạn muốn tra. Bạn có thể nhắn lại tên thành phố rõ hơn không?"
     try:
         if day == "today":
             r = requests.get("https://api.openweathermap.org/data/2.5/weather",
@@ -505,20 +411,30 @@ def get_weather_snapshot(text: str) -> str:
         print("OpenWeather error:", e)
         return "Mình không lấy được thông tin thời tiết lúc này."
 
-# =================== CRYPTO / TICKER NORMALIZER ===================
+# =================== CRYPTO / TICKER NORMALIZATION ===================
 COIN_SYNONYM = {
-    "bitcoin":"BTC","btc":"BTC","ethereum":"ETH","eth":"ETH","binance coin":"BNB","bnb":"BNB",
-    "solana":"SOL","sol":"SOL","worldcoin":"WLD","wld":"WLD","ton":"TON","toncoin":"TON",
-    "dogecoin":"DOGE","doge":"DOGE","cardano":"ADA","ada":"ADA"
+    "bitcoin":"BTC", "btc":"BTC",
+    "ethereum":"ETH","eth":"ETH",
+    "binance coin":"BNB","bnb":"BNB",
+    "solana":"SOL","sol":"SOL",
+    "worldcoin":"WLD","wld":"WLD",
+    "ton":"TON","toncoin":"TON",
+    "dogecoin":"DOGE","doge":"DOGE",
+    "cardano":"ADA","ada":"ADA",
 }
+
 def guess_symbol_from_text(text: str) -> Optional[str]:
-    m = re.search(r"\b[A-Z]{2,6}\b", text or "")
+    # 1) tìm code xuất hiện sẵn
+    m = re.search(r"\b[A-Z]{2,6}\b", text)
     if m: return m.group(0)
     low = (text or "").lower()
     for k,v in COIN_SYNONYM.items():
         if k in low: return v
+    # 2) nếu có gợi ý crypto
     is_crypto = any(x in low for x in ["coin","crypto","token","chain","btc","eth","wld","sol","ada","doge"])
-    return serper_guess_symbol(text, is_crypto_hint=is_crypto)
+    # 3) nhờ Serper đoán
+    sym = serper_guess_symbol(text, is_crypto_hint=is_crypto)
+    return sym
 
 def build_crypto_queries_by_symbol(symbol: str) -> List[str]:
     return [
@@ -545,7 +461,7 @@ def agent_crypto_ta(text: str) -> str:
     headline = f"Snapshot kỹ thuật cho {symbol} (tổng hợp công khai, không phải lời khuyên):"
     return f"{headline}\n\n{bundle}"
 
-# =================== AGENT PLANNER & RESPONDER ===================
+# =================== PLANNER & RESPONDER ===================
 def planner(text: str, has_image: bool, event_name: str) -> Dict[str, Any]:
     t = (text or "").lower()
     if has_image: return {"mode":"VISION","need_web":False,"need_empathy":False,"need_sales":False,"need_weather":False}
@@ -587,9 +503,9 @@ def agent_sticker_mood(image_bytes: Optional[bytes]) -> str:
 
 def brand_guard(text: str) -> str:
     if not text: return text
-    bad = [r"được\s+google\s+phát\s+triển", r"do\s+google\s+xây\s+dựng", r"sản\s+phẩm\s+của\s+google",
-           r"của\s+openai", r"của\s+anthropic", r"của\s+deepmind", r"của\s+gemini", r"mình\s+thuộc\s+google",
-           r"gemini\s+phát\s+triển"]
+    bad = [r"được\s+google\s+phát\s+triển", r"do\s+google\s+xây\s+dựng",
+           r"sản\s+phẩm\s+của\s+google", r"của\s+openai", r"của\s+anthropic",
+           r"của\s+deepmind", r"của\s+gemini", r"mình\s+thuộc\s+google", r"gemini\s+phát\s+triển"]
     out = text
     for pat in bad: out = re.sub(pat, BRAND_DEVLINE, out, flags=re.IGNORECASE)
     out = re.sub(r"trí tuệ nhân tạo(.*)google", f"trí tuệ nhân tạo {BRAND_DEVLINE}", out, flags=re.IGNORECASE)
@@ -677,36 +593,14 @@ def welcome_line(profile: Dict[str, Any]) -> str:
     if EMOJI_ENABLED: w += " " + emoji("🙂")
     return w
 
-# =================== KEEPALIVE ===================
-def _keepalive_loop():
-    if not KEEPALIVE_URL: return
-    while True:
-        try:
-            pause = KEEPALIVE_INTERVAL_SEC + random.randint(0, max(1, KEEPALIVE_JITTER_SEC))
-            time.sleep(pause)
-            requests.get(KEEPALIVE_URL, timeout=8, headers={"User-Agent": "locaith-keepalive/1.0"})
-        except Exception as e:
-            print("keepalive error:", e)
-
 # =================== ROUTES ===================
 @app.on_event("startup")
 async def on_start():
-    print("Locaith AI – Zalo webhook started v3.6.0")
+    print("Locaith AI – Zalo webhook started v3.5.0")
     if PROMPT_CONFIG_PATH: print("Loaded runtime prompt from:", PROMPT_CONFIG_PATH)
-    # load cache token lần đầu để chắc chắn có token
-    if not TOKEN.get():
-        print("WARNING: ZALO_OA_TOKEN rỗng. Sẽ chỉ gửi được sau khi refresh thành công.")
-    if KEEPALIVE_URL:
-        threading.Thread(target=_keepalive_loop, daemon=True).start()
 
 @app.get("/health")
-def health(): return {"status":"ok","version":"3.6.0","ts":time.time()}
-
-@app.get("/ping")
-def ping(token: str = Query(default="", alias="token")):
-    if KEEPALIVE_TOKEN and token != KEEPALIVE_TOKEN:
-        raise HTTPException(status_code=404)
-    return {"ok": True, "ts": time.time()}
+def health(): return {"status":"ok","version":"3.5.0","ts":time.time()}
 
 @app.get("/{verify_name}")
 def zalo_verify(verify_name: str):
@@ -716,22 +610,26 @@ def zalo_verify(verify_name: str):
     raise HTTPException(status_code=404)
 
 @app.get("/zalo/webhook")
-def webhook_verify(challenge: str = ""):
-    return {"challenge": challenge} if challenge else {"error":"missing challenge"}
-
-def extract_user_id_for_send(event: dict) -> Optional[str]:
-    return event.get("user_id_by_app") or (event.get("sender") or {}).get("id")
+def webhook_verify(challenge: str = ""): return {"challenge": challenge} if challenge else {"error":"missing challenge"}
 
 @app.post("/zalo/webhook")
 async def webhook(req: Request):
-    # Zalo có thể bật chữ ký; nếu bạn cần, bật ENABLE_APPSECRET_PROOF cho outbound thôi.
+    if ENABLE_APPSECRET and ZALO_APP_SECRET:
+        try:
+            body = await req.body()
+            signature = req.headers.get("X-ZEvent-Signature","")
+            expected = hmac.new(ZALO_APP_SECRET.encode(), body, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(signature, expected):
+                return {"status":"invalid_signature"}
+        except Exception: pass
+
     event = await req.json()
     print("EVENT:", json.dumps(event, ensure_ascii=False))
     event_id = extract_event_id(event)
     if already_processed(event_id): return {"status":"duplicate_ignored"}
 
     event_name = event.get("event_name","")
-    user_id = extract_user_id_for_send(event)
+    user_id = (event.get("sender") or {}).get("id")
     if not user_id: return {"status":"no_user"}
 
     if is_spamming(user_id):
@@ -753,24 +651,24 @@ async def webhook(req: Request):
     salute = salute.group(0).strip() if salute else s.get("salute")
     if salute and s.get("salute") != salute: s["salute"] = salute
 
-    has_img = False
-    img_bytes = None
-    if event_name in ["user_send_image","user_send_sticker"]:
-        img_bytes = get_image_or_sticker_bytes(event)
-        has_img = bool(img_bytes) and event_name == "user_send_image"
+    img_bytes = get_image_or_sticker_bytes(event) if event_name in ["user_send_image","user_send_sticker"] else None
+    has_image = bool(img_bytes) and event_name == "user_send_image"
 
+    # acks cho các loại non-text
     if event_name in ["user_send_gif","user_send_audio","user_send_video","user_send_file","user_send_location"] and not text:
         short = {"user_send_gif":"Mình đã nhận ảnh động.","user_send_audio":"Mình đã nhận voice.",
                  "user_send_video":"Mình đã nhận video.","user_send_file":"Mình đã nhận file.",
                  "user_send_location":"Mình đã nhận vị trí."}[event_name]
         zalo_send_text(user_id, short); push_history(user_id, "assistant", short); return {"status":"ok"}
 
-    plan = planner(text, has_img, event_name); mode = plan["mode"]
+    plan = planner(text, has_image, event_name)
+    mode = plan["mode"]
     web_ctx = ""; vision_ctx = ""; mood_ctx = ""; tech_ctx = ""; weather_ctx = ""
 
     if event_name == "user_send_sticker":
         mood_ctx = agent_sticker_mood(img_bytes); mode = "EMPATHY"
-    if has_img: vision_ctx = agent_vision_summary(img_bytes); mode = "VISION"
+    if has_image:
+        vision_ctx = agent_vision_summary(img_bytes); mode = "VISION"
     if plan.get("need_weather"): weather_ctx = get_weather_snapshot(text)
     if mode == "CRYPTO_TA": tech_ctx = agent_crypto_ta(text)
     elif plan.get("need_web") and text: web_ctx = serper_search(text, 3)
@@ -797,7 +695,7 @@ async def webhook(req: Request):
     s["notes"].clear(); s["last_seen"] = time.time()
     return {"status":"ok"}
 
-# Optional KB ingest
+# Optional: future KB ingest
 @app.post("/kb/url")
 def kb_url(user_id: str = Form(...), url: str = Form(...)):
     return {"ok": True, "note": "Placeholder ingest. Có thể mở rộng RAG sau."}
